@@ -4,6 +4,7 @@ import os
 from dotenv import load_dotenv
 from src.utils.logger import log_experiment
 from src.services.file_handler import file_service
+from src.services.static_analyzer import static_analyzer_service
 
 load_dotenv()
 
@@ -23,12 +24,20 @@ def main():
 if __name__ == "__main__":
     main()        #comment this line if you wanna test the file service
     
-    # ptf = './sandbox/idk.py'
+    ptf = './sandbox/idk.py'
     # txt = file_service.read_file_to_text(ptf)
     # print(txt)
     # txt += '\nprint("ooooh I am working")'
     # file_service.write_text_to_file(ptf, txt)
 
     # print('done')
+    # rslt = static_analyzer_service.analyze(ptf)
+    # print(rslt.issues)
+
+   
+
+
+
+
     pass
     
