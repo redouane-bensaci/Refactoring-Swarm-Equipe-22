@@ -16,7 +16,11 @@ class StaticAnalyzerService:
             'missing-final-newline',
             'invalid-name',
             'line-too-long',
-            'too-few-public-methods'
+            'too-few-public-methods',
+            'Final newline missing',
+            'Missing module docstring',
+            'UPPER_CASE naming style',
+
         ]
     
     def run_pylint(self, file_path: str) -> tuple:
@@ -88,7 +92,7 @@ class StaticAnalyzerService:
         """Filter out minor style issues."""
         important = []
         for issue in issues:
-            if not any(keyword in issue.lower() for keyword in self.ignore_keywords):
+            if not any(keyword in issue for keyword in self.ignore_keywords):
                 important.append(issue)
         return important
     def _format_readable(self, file_path: str, score: float, issues: list) -> str:
