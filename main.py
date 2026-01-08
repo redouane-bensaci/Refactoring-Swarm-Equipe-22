@@ -30,21 +30,33 @@ class AgentState(TypedDict):
 # Wrap agents for graph nodes
 # -----------------------------
 def auditor_node(state: AgentState):
-    result = run_auditor_agent({"input": state["input"]})
+    print("🔍 Running Auditor Agent...")
+    result = run_auditor_agent({"input": state["input"], "output": ""})
     return {
-        "output": result
+        "input": state["input"],           # Keep the directory path
+        "output": result["output"]         # FIX: Extract output from result dict
     }
 
 def fixer_node(state: AgentState):
-    result = run_fixer_agent({"input": state["input"]})
+    print("🔧 Running Fixer Agent...")
+    result = run_fixer_agent({
+        "input": state["input"],           # Directory path
+        "output": state["output"]          # FIX: Pass auditor's refactoring plan
+    })
     return {
-        "output": result
+        "input": state["input"],           # Keep the directory path
+        "output": result["output"]         # FIX: Extract output from result dict
     }
 
 def judge_node(state: AgentState):
-    result = run_judge_agent({"input": state["input"]})
+    print("⚖️ Running Judge Agent...")
+    result = run_judge_agent({
+        "input": state["input"],           # Directory path
+        "output": state["output"]          # FIX: Pass fixer's report
+    })
     return {
-        "output": result
+        "input": state["input"],           # Keep the directory path
+        "output": result["output"]         # FIX: Extract output from result dict
     }
 
 # -----------------------------
@@ -60,6 +72,7 @@ workflow.set_entry_point("auditor_agent")
 workflow.add_edge("auditor_agent", "fixer_agent")
 workflow.add_edge("fixer_agent", "judge_agent")
 workflow.add_edge("judge_agent", "__end__")
+
 # -----------------------------
 # Persistence
 # -----------------------------
@@ -79,14 +92,16 @@ def main():
         sys.exit(1)
 
     print(f"🚀 Starting workflow on: {args.target_dir}")
-    # log_experiment("System", "STARTUP", f"Target: {args.target_dir}", "INFO")
 
     # -----------------------------
     # Run the workflow
     # -----------------------------
     print("✅ LangGraph workflow running...")
     config = {"configurable": {"thread_id": "session_1"}}
-    result = app.invoke({"input": args.target_dir}, config=config)
+    
+    # FIX: Initialize with both input AND output fields
+    result = app.invoke({"input": args.target_dir, "output": ""}, config=config)
+    
     print(f"\n💡 Final Output:\n{result['output']}\n")
 
     # -----------------------------

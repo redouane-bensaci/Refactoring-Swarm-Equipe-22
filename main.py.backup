@@ -1,0 +1,42 @@
+import argparse
+import os
+import sys
+from src.swarm_orchestrator import app
+
+def main():
+    print("Starting main function...")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target_dir", required=True, help="Directory with buggy code")
+    args = parser.parse_args()
+    print(f"Parsed args: {args}")
+
+    if not os.path.exists(args.target_dir):
+        print(f"❌ Directory {args.target_dir} not found.")
+        return
+
+    print("Running workflow...")
+    # Initial state
+    initial_state = {
+        "input": f"Process all Python files in {args.target_dir}",
+        "chat_history": [],
+        "iteration_count": 0,
+        "output": "",
+        "auditor_report": "",
+        "fixer_status": "",
+        "judge_verdict": "",
+        "error_logs": []
+    }
+
+    # Run workflow
+    config = {"configurable": {"thread_id": "default"}}
+    final_state = app.invoke(initial_state, config)
+
+    print("\n" + "="*50)
+    print("WORKFLOW COMPLETE")
+    print("="*50)
+    print(f"Final Status: {final_state['judge_verdict']}")
+    print(f"Iterations: {final_state['iteration_count']}")
+    print(f"Output: {final_state['output']}")
+
+if __name__ == "__main__":
+    main()
