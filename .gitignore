@@ -1,17 +1,36 @@
-# .gitignore
+# Python
 __pycache__/
 *.pyc
-# .gitignore
-__pycache__/
-*.pyc
+*.pyo
+*.pyd
+.Python
 venv/
+env/
+.venv/
+
+# Environment
 .env
+.env.local
+
+# OS
 .DS_Store
 
-# Dossier de travail temporaire (ne pas récupérer les modifications des étudiants ici)
+# Node (not used, but just in case)
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+
+# Sandbox (student work directory)
 sandbox/
 
-# LOGS : On ignore tout le dossier logs...
+# Logs - ignore all except experiment data
 logs/*
-# ...SAUF le fichier de données final qu'on veut récupérer
 !logs/experiment_data.json
+
+# Backup files
+*.bak
+*.backup
+*.old

@@ -213,13 +213,9 @@ from src.utils.llm_fallback import FREE_MODELS, NonStreamingChatOpenAI
 def run_auditor_agent(state: AgentState):
     """Run auditor agent with automatic model fallback."""
     last_exception = None
-    max_models = min(10, len(FREE_MODELS))  # Try up to 10 models
     
-    for i, model in enumerate(FREE_MODELS[:max_models]):
+    for model in FREE_MODELS:
         try:
-            print(f"🔄 Auditor: Attempting with model {i+1}/{max_models}: {model}")
-            
-            # Create a new LLM with this model
             fallback_llm = NonStreamingChatOpenAI(
                 model=model,
                 api_key=OPENROUTER_API_KEY,
@@ -229,7 +225,6 @@ def run_auditor_agent(state: AgentState):
                 model_kwargs={},
             )
             
-            # Create agent with fallback LLM
             fallback_agent = create_openai_tools_agent(fallback_llm, tools, prompt)
             fallback_executor = AgentExecutor(
                 agent=fallback_agent,
@@ -242,28 +237,20 @@ def run_auditor_agent(state: AgentState):
                 {"input": state["input"]},
                 config={"callbacks": []}
             )
-            print(f"✅ Auditor: Success with model: {model}")
-            return {"output": response["output"]}
+            return {"output": response["output"], "model_used": model}
             
         except Exception as e:
             error_str = str(e).lower()
             last_exception = e
             
-            # Check for retryable errors
             retryable = any(x in error_str for x in [
                 "429", "rate limit", "streaming", "tools are not supported", 
                 "400", "404", "no endpoints", "tool use", "provider"
             ])
             
             if retryable:
-                print(f"⚠️ Auditor: Model {model} failed: {str(e)[:150]}...")
-                if i < max_models - 1:
-                    import time
-                    print(f"⏳ Waiting 3 seconds before trying next model...")
-                    time.sleep(3)
                 continue
             else:
                 raise e
     
-    print(f"❌ Auditor: All {max_models} models failed!")
     raise last_exception

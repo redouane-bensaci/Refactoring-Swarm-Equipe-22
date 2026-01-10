@@ -1,16 +1,14 @@
 import os
 import sys
 import argparse
-import time
 from dotenv import load_dotenv
 from typing import TypedDict
 
-from src.utils.logger import log_experiment
-from src.services.file_handler import file_service
-from src.services.static_analyzer import static_analyzer_service
+from src.utils.logger import log_startup, log_agent_interaction, log_completion, ActionType
 from src.agents.fixer_agent import run_fixer_agent  
 from src.agents.auditor_agent import run_auditor_agent
 from src.agents.judge_agent import run_judge_agent
+from src.utils.llm_fallback import FREE_MODELS
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -28,46 +26,97 @@ class AgentState(TypedDict):
     output: str          # Current output/report
     iteration: int       # Track iterations for fixer-judge loop
     test_passed: bool    # Whether tests passed
+    model_used: str      # Track which model was used
 
 # -----------------------------
 # Wrap agents for graph nodes
 # -----------------------------
 def auditor_node(state: AgentState):
-    print("\n🔍 Running Auditor Agent...")
+    input_prompt = f"Analyze directory: {state['input']}"
     result = run_auditor_agent({"input": state["input"], "output": ""})
+    
+    log_agent_interaction(
+        agent_name="Auditor",
+        model_used=result.get("model_used", FREE_MODELS[0]),
+        action=ActionType.ANALYSIS,
+        input_prompt=input_prompt,
+        output_response=result["output"],
+        status="SUCCESS",
+        iteration=0
+    )
+    
     return {
         "input": state["input"],
         "output": result["output"],
         "iteration": 0,
         "test_passed": False,
+        "model_used": result.get("model_used", ""),
     }
 
 def fixer_node(state: AgentState):
-    print("\n🔧 Running Fixer Agent...")
+    input_prompt = f"Fix code based on: {state['output'][:500]}"
     result = run_fixer_agent({
         "input": state["input"],
         "output": state["output"]
     })
+    
+    iteration = state.get("iteration", 0) + 1
+    log_agent_interaction(
+        agent_name="Fixer",
+        model_used=result.get("model_used", FREE_MODELS[0]),
+        action=ActionType.FIX,
+        input_prompt=input_prompt,
+        output_response=result["output"],
+        status="SUCCESS",
+        iteration=iteration
+    )
+    
     return {
         "input": state["input"],
         "output": result["output"],
-        "iteration": state.get("iteration", 0) + 1,
+        "iteration": iteration,
         "test_passed": state.get("test_passed", False),
+        "model_used": result.get("model_used", ""),
     }
 
 def judge_node(state: AgentState):
-    print("\n⚖️ Running Judge Agent...")
+    input_prompt = f"Verify fixes in: {state['input']}"
     result = run_judge_agent({
         "input": state["input"],
         "output": state["output"]
     })
     
-    # Check if tests passed by looking for common pytest success indicators
-    output = result["output"].lower()
-    test_passed = (
-        ("passed" in output and "failed" not in output) or
-        ("all tests passed" in output) or
-        ("100%" in output and "failed" not in output)
+    # Check if tests passed using the VERDICT signal
+    output = result["output"]
+    output_lower = output.lower()
+    
+    # Primary: Look for explicit VERDICT
+    if "verdict: all_tests_passed" in output_lower:
+        test_passed = True
+    elif "verdict: tests_failed" in output_lower:
+        test_passed = False
+    else:
+        # Fallback: Parse pytest output format "X passed" with no failures
+        import re
+        passed_match = re.search(r'(\d+)\s+passed', output_lower)
+        failed_match = re.search(r'(\d+)\s+failed', output_lower)
+        
+        if passed_match:
+            passed_count = int(passed_match.group(1))
+            failed_count = int(failed_match.group(1)) if failed_match else 0
+            test_passed = passed_count > 0 and failed_count == 0
+        else:
+            test_passed = False
+    
+    log_agent_interaction(
+        agent_name="Judge",
+        model_used=result.get("model_used", FREE_MODELS[0]),
+        action=ActionType.TEST,
+        input_prompt=input_prompt,
+        output_response=result["output"],
+        status="SUCCESS" if test_passed else "TESTS_FAILED",
+        iteration=state.get("iteration", 0),
+        extra_details={"test_passed": test_passed}
     )
     
     return {
@@ -75,6 +124,7 @@ def judge_node(state: AgentState):
         "output": result["output"],
         "iteration": state.get("iteration", 0),
         "test_passed": test_passed,
+        "model_used": result.get("model_used", ""),
     }
 
 def should_continue(state: AgentState) -> str:
@@ -86,21 +136,15 @@ def should_continue(state: AgentState) -> str:
     max_iterations = 3
     
     if state.get("test_passed", False):
-        print("\n✅ Tests PASSED! Ending workflow.")
         return "end"
     
     if state.get("iteration", 0) >= max_iterations:
-        print(f"\n⚠️ Max iterations ({max_iterations}) reached. Ending workflow.")
         return "end"
     
-    print(f"\n❌ Tests FAILED. Returning to Fixer (iteration {state.get('iteration', 0)})...")
     return "prepare_feedback"
 
 def prepare_feedback(state: AgentState):
-    """Prepare feedback from judge for the fixer agent with rate limit delay."""
-    print("\n⏳ Waiting 60 seconds before next iteration (rate limit protection)...")
-    time.sleep(60)
-    
+    """Prepare feedback from judge for the fixer agent."""
     feedback = f"""
 === TEST FAILURE FEEDBACK ===
 The following issues were found during testing:
@@ -167,47 +211,34 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.target_dir):
-        print(f"❌ Target directory '{args.target_dir}' not found.")
         sys.exit(1)
 
-    print(f"🚀 Starting workflow on: {args.target_dir}")
-    print("📋 Pipeline: Auditor -> Fixer <-> Judge (loop until tests pass)")
+    # Log experiment startup
+    log_startup(target_dir=args.target_dir, models=FREE_MODELS)
 
     # -----------------------------
     # Run the workflow
     # -----------------------------
-    print("\n✅ LangGraph workflow running...")
     config = {"configurable": {"thread_id": "session_1"}}
     
-    # Initialize with all state fields
     result = app.invoke({
         "input": args.target_dir,
         "output": "",
         "iteration": 0,
         "test_passed": False,
+        "model_used": "",
     }, config=config)
     
-    print(f"\n{'='*50}")
-    print("📊 FINAL RESULT")
-    print(f"{'='*50}")
-    print(f"Iterations: {result.get('iteration', 'N/A')}")
+    # Log experiment completion
+    log_completion(
+        iterations=result.get('iteration', 0),
+        test_passed=result.get('test_passed', False),
+        final_output=result['output']
+    )
+    
+    print(f"\nIterations: {result.get('iteration', 'N/A')}")
     print(f"Tests Passed: {result.get('test_passed', False)}")
-    print(f"\n💡 Final Output:\n{result['output']}\n")
-
-    # -----------------------------
-    # Optional: Static analysis log
-    # -----------------------------
-    print("🔍 Static Analysis Summary:")
-    for root, _, files in os.walk(args.target_dir):
-        for file in files:
-            if file.endswith(".py"):
-                path = os.path.join(root, file)
-                analysis = static_analyzer_service.analyze(path)
-                print(f"- {file}: {len(analysis.issues)} issues detected")
-                for issue in analysis.issues:
-                    print(f"  • {issue}")
-
-    print("\n✅ Mission Complete!")
+    print(f"\nFinal Output:\n{result['output']}\n")
 
 # -----------------------------
 # Entry Point
