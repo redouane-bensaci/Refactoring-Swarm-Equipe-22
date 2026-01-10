@@ -14,6 +14,10 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
+from src.prompts.fixer_prompts import get_fixer_system_prompt, get_fixer_user_prompt
+from src.utils.logger import log_experiment, ActionType
+
+
 # 1. Setup Environment
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -85,37 +89,76 @@ def list_sandbox_files() -> list[str]:
         return [f"Error listing files: {str(e)}"]
     
 tools = [read_file_content, write_file_content, list_sandbox_files]
-# 4. Define Prompt and Agent Executor
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are an expert Senior Software Engineer. 
-    Your task is to:
-    1. Read all buggy Python files in the input directory.
-    2. Read the corresponding refactoring plan files located in './sandbox/<original_filename>_refactor_plan.txt'.
-    3. Apply the fixes described in the refactoring plans **directly to the original source files** (overwrite the original files).
-    4. Generate pytest functions for each corrected file and write them to './sandbox/test_runner.py'. 
-    - The tests should **call the fixed functions**, do not redefine them.
-    5. For each corrected file, return the filename and full corrected code.
-    Always ensure your output is structured and complete for each file, and do not create any separate corrected copies. The original source files should be fully updated."""),  
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
 
-fixer_agent = create_openai_tools_agent(llm, tools, prompt)
-fixer_agent_executor = AgentExecutor(agent=fixer_agent, tools=tools, verbose=True)
+
+# 4. Define Prompt and Agent Executor
+def create_fixer_agent(target_dir: str, iteration: int = 1):
+    system_prompt = get_fixer_system_prompt(target_dir, iteration, max_iterations=10)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    
+    agent = create_openai_tools_agent(llm, tools, prompt)
+    return AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+def run_fixer_agent(target_dir: str, iteration: int = 1) -> dict:
+    agent_executor = create_fixer_agent(target_dir)
+    user_input = get_fixer_user_prompt(target_dir)
+    
+    # Log before execution
+    log_experiment(
+        agent_name="Auditor_Agent",
+        model_used="meta-llama/llama-3.3-70b-instruct:free",
+        action=ActionType.FIX,
+        details={
+            "input_prompt": user_input,
+            "target_directory": target_dir,
+            "output_response": ""  # later
+        },
+        status="IN_PROGRESS"
+    )
+    
+    try:
+        result = agent_executor.invoke({"input": user_input})
+        
+        # Log success
+        log_experiment(
+            agent_name="Auditor_Agent",
+            model_used="meta-llama/llama-3.3-70b-instruct:free",
+            action=ActionType.FIX,
+            details={
+                "input_prompt": user_input,
+                "output_response": result["output"],
+                "target_directory": target_dir
+            },
+            status="SUCCESS"
+        )
+        
+        return {"output": result["output"], "status": "SUCCESS"}
+    
+    except Exception as e:
+        # Log failure
+        log_experiment(
+            agent_name="Auditor_Agent",
+            model_used="meta-llama/llama-3.3-70b-instruct:free",
+            action=ActionType.FIX,
+            details={
+                "input_prompt": user_input,
+                "output_response": str(e)
+            },
+            status="FAILURE"
+        )
+        
+        return {"output": str(e), "status": "FAILURE"}
+
 
 # 5. DEFINE LANGGRAPH 0.0.25 LOGIC
 class AgentState(TypedDict):
     input: str
     output: str
 
-def run_fixer_agent(state: AgentState):
-    response = fixer_agent_executor.invoke(
-        {
-            "input": state["input"]
-        },
-        # This config helps override legacy streaming behaviors
-        config={"callbacks": []} 
-    )
-
-    return {
-        "output": response["output"]
-    }
+def run_fixer_agent_langgraph(state: AgentState):
+    
+    result = run_fixer_agent(state["input"])
+    return {"output": result["output"]}
