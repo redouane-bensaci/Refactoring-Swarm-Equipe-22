@@ -230,15 +230,65 @@ class AgentState(TypedDict):
     input: str
     output: str
 
-def run_judge_agent(state: AgentState):
-    response = judge_agent_executor.invoke(
-        {
-            "input": state["input"],
-            "output": state["output"],  # FIXED: Pass the fixer's output
-        },
-        config={"callbacks": []} 
-    )
+# Import fallback utilities
+from src.utils.llm_fallback import FREE_MODELS, NonStreamingChatOpenAI
 
-    return {
-        "output": response["output"]
-    }
+def run_judge_agent(state: AgentState):
+    """Run judge agent with automatic model fallback."""
+    last_exception = None
+    max_models = min(10, len(FREE_MODELS))  # Try up to 10 models
+    
+    for i, model in enumerate(FREE_MODELS[:max_models]):
+        try:
+            print(f"🔄 Judge: Attempting with model {i+1}/{max_models}: {model}")
+            
+            # Create a new LLM with this model
+            fallback_llm = NonStreamingChatOpenAI(
+                model=model,
+                api_key=OPENROUTER_API_KEY,
+                temperature=0,
+                base_url="https://openrouter.ai/api/v1",
+                streaming=False,
+                model_kwargs={},
+            )
+            
+            # Create agent with fallback LLM
+            fallback_agent = create_openai_tools_agent(fallback_llm, tools, prompt)
+            fallback_executor = AgentExecutor(
+                agent=fallback_agent,
+                tools=tools,
+                verbose=True,
+                handle_parsing_errors=True,
+                max_iterations=20,
+                early_stopping_method="generate",
+            )
+            
+            response = fallback_executor.invoke(
+                {"input": state["input"], "output": state["output"]},
+                config={"callbacks": []}
+            )
+            print(f"✅ Judge: Success with model: {model}")
+            return {"output": response["output"]}
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            last_exception = e
+            
+            # Check for retryable errors
+            retryable = any(x in error_str for x in [
+                "429", "rate limit", "streaming", "tools are not supported", 
+                "400", "404", "no endpoints", "tool use", "provider"
+            ])
+            
+            if retryable:
+                print(f"⚠️ Judge: Model {model} failed: {str(e)[:150]}...")
+                if i < max_models - 1:
+                    import time
+                    print(f"⏳ Waiting 3 seconds before trying next model...")
+                    time.sleep(3)
+                continue
+            else:
+                raise e
+    
+    print(f"❌ Judge: All {max_models} models failed!")
+    raise last_exception

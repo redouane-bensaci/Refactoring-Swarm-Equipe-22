@@ -21,9 +21,10 @@ from langgraph.checkpoint.memory import MemorySaver
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY2 environment variable is not set")
+    raise ValueError("OPENROUTER_API_KEY environment variable is not set")
+
 # This will be used to restrict the use of the tools to the sandbox directory (security measure)
-SANDBOX_ROOT = Path(".").resolve()
+SANDBOX_ROOT = (Path(__file__).parent.parent.parent / "sandbox").resolve()
 
 # 2. Initialize LLM (Streaming must be False for OpenRouter tool calls)
 # Create a wrapper class to force non-streaming behavior
@@ -70,19 +71,29 @@ llm = NonStreamingChatOpenAI(
 # 3. Define Tools
 
 @tool
-
 def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]:
     """
     Read file names/paths in a directory for the agent to process individually.
     
     Args:
-        directory_path: Path to the directory to read
+        directory_path: Path to the directory to read (e.g., './sandbox/test3' or 'test3')
         
     Returns:
         Dictionary containing directory info and list of file paths
     """
     try:
-        dir_path = Path(directory_path)
+        # Handle different path formats
+        if directory_path.startswith('./sandbox/'):
+            directory_path = directory_path.replace('./sandbox/', '', 1)
+        elif directory_path.startswith('sandbox/'):
+            directory_path = directory_path.replace('sandbox/', '', 1)
+        
+        # Use SANDBOX_ROOT as base
+        dir_path = (SANDBOX_ROOT / directory_path).resolve()
+        
+        # Security check
+        if not dir_path.is_relative_to(SANDBOX_ROOT):
+            return {"error": f"Access denied: path outside sandbox"}
         
         if not dir_path.exists():
             return {"error": f"Directory not found: {directory_path}"}
@@ -90,10 +101,10 @@ def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]
         if not dir_path.is_dir():
             return {"error": f"Path is not a directory: {directory_path}"}
         
-        file_paths = [str(f) for f in sorted(dir_path.iterdir()) if f.is_file()]
+        file_paths = [str(f.relative_to(SANDBOX_ROOT)) for f in sorted(dir_path.iterdir()) if f.is_file()]
         
         return {
-            "directory": str(dir_path),
+            "directory": str(dir_path.relative_to(SANDBOX_ROOT)),
             "file_count": len(file_paths),
             "files": file_paths
         }
@@ -103,8 +114,15 @@ def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]
 
 @tool
 def read_file_content(file_path: str) -> str:
-    """Reads the content of a file from the local disk."""
+    """Reads the content of a file from the local disk.
+    
+    Args:
+        file_path: Relative path from sandbox root (e.g., 'test3/add.py')
+    """
     try:
+        if file_path.startswith('sandbox/'):
+            file_path = file_path.replace('sandbox/', '', 1)
+            
         safe_path = (SANDBOX_ROOT / file_path).resolve()
 
         # Security check: ensure the test file is within the sandbox
@@ -127,10 +145,15 @@ def read_file_content(file_path: str) -> str:
 
 @tool
 def run_pylint(file_path: str) -> str:
-    """Runs pylint on the given file and returns the output as a string."""
-    if not os.path.exists(file_path):
-        return f"❌ File not found: {file_path}"
+    """Runs pylint on the given file and returns the output as a string.
+    
+    Args:
+        file_path: Relative path from sandbox root (e.g., 'test3/add.py')
+    """
     try:
+        if file_path.startswith('sandbox/'):
+            file_path = file_path.replace('sandbox/', '', 1)
+            
         safe_path = (SANDBOX_ROOT / file_path).resolve()
 
         # Security check: ensure the test file is within the sandbox
@@ -145,9 +168,9 @@ def run_pylint(file_path: str) -> str:
         if not safe_path.is_file():
             return f"Not a file: {file_path}"
         
-        # Run pylint as a subprocess
+        # Run pylint as a subprocess using the resolved path
         result = subprocess.run(
-            ["pylint", "--output-format=text", file_path],
+            ["pylint", "--output-format=text", str(safe_path)],
             capture_output=True,
             text=True
         )
@@ -184,16 +207,63 @@ class AgentState(TypedDict):
     input: str
     output: str
 
+# Import fallback utilities
+from src.utils.llm_fallback import FREE_MODELS, NonStreamingChatOpenAI
+
 def run_auditor_agent(state: AgentState):
-
-    response = auditor_agent_executor.invoke(
-        {
-            "input": state["input"],
-        },
-        # This config helps override legacy streaming behaviors
-        config={"callbacks": []} 
-    )
-
-    return {
-        "output": response["output"]
-    }
+    """Run auditor agent with automatic model fallback."""
+    last_exception = None
+    max_models = min(10, len(FREE_MODELS))  # Try up to 10 models
+    
+    for i, model in enumerate(FREE_MODELS[:max_models]):
+        try:
+            print(f"🔄 Auditor: Attempting with model {i+1}/{max_models}: {model}")
+            
+            # Create a new LLM with this model
+            fallback_llm = NonStreamingChatOpenAI(
+                model=model,
+                api_key=OPENROUTER_API_KEY,
+                temperature=0,
+                base_url="https://openrouter.ai/api/v1",
+                streaming=False,
+                model_kwargs={},
+            )
+            
+            # Create agent with fallback LLM
+            fallback_agent = create_openai_tools_agent(fallback_llm, tools, prompt)
+            fallback_executor = AgentExecutor(
+                agent=fallback_agent,
+                tools=tools,
+                verbose=True,
+                handle_parsing_errors=True,
+            )
+            
+            response = fallback_executor.invoke(
+                {"input": state["input"]},
+                config={"callbacks": []}
+            )
+            print(f"✅ Auditor: Success with model: {model}")
+            return {"output": response["output"]}
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            last_exception = e
+            
+            # Check for retryable errors
+            retryable = any(x in error_str for x in [
+                "429", "rate limit", "streaming", "tools are not supported", 
+                "400", "404", "no endpoints", "tool use", "provider"
+            ])
+            
+            if retryable:
+                print(f"⚠️ Auditor: Model {model} failed: {str(e)[:150]}...")
+                if i < max_models - 1:
+                    import time
+                    print(f"⏳ Waiting 3 seconds before trying next model...")
+                    time.sleep(3)
+                continue
+            else:
+                raise e
+    
+    print(f"❌ Auditor: All {max_models} models failed!")
+    raise last_exception
