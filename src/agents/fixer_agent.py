@@ -1,6 +1,7 @@
 import os
 import subprocess
 from pathlib import Path
+from typing import Dict, List, Union
 from dotenv import load_dotenv
 
 # Core LangChain 0.1.10 imports
@@ -18,18 +19,46 @@ if not OPENROUTER_API_KEY:
 SANDBOX_ROOT = (Path(__file__).parent.parent.parent / "sandbox").resolve()
 
 # 2. Initialize LLM - CRITICAL: No streaming
-llm = ChatOpenAI(
+# Create a wrapper class to force non-streaming behavior
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_core.messages import AIMessageChunk, AIMessage
+from langchain_core.outputs import ChatGeneration
+
+class NonStreamingChatOpenAI(ChatOpenAI):
+    """Wrapper that forces non-streaming behavior for OpenRouter compatibility."""
+    
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        # Override stream to use non-streaming invoke instead
+        # This prevents the "Tools not supported in streaming mode" error
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        
+        # Call _generate with stream explicitly disabled
+        result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        message = result.generations[0].message
+        chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=message.content,
+                additional_kwargs=message.additional_kwargs,
+                id=message.id if hasattr(message, 'id') else None,
+            )
+        )
+        yield chunk
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # Ensure stream is always False
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+llm = NonStreamingChatOpenAI(
     model="meta-llama/llama-3.3-70b-instruct:free",
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
     temperature=0,
+    streaming=False,
+    model_kwargs={},
 )
-
-# FORCE disable streaming in multiple ways
-llm.streaming = False
-if hasattr(llm, 'model_kwargs'):
-    llm.model_kwargs = llm.model_kwargs or {}
-    llm.model_kwargs['stream'] = False
 
 # 3. Define Tools
 @tool
@@ -84,22 +113,38 @@ def write_file_content(file_path: str, content: str) -> str:
         return f"❌ Error writing to file: {str(e)}"
 
 @tool
-def list_sandbox_files() -> str:
-    """List all Python files in the sandbox directory (recursively).
-    Returns a formatted string of file paths relative to sandbox root."""
-    try:
-        files = [
-            str(f.relative_to(SANDBOX_ROOT))
-            for f in SANDBOX_ROOT.rglob("*.py")
-            if f.is_file()
-        ]
-        if not files:
-            return "No Python files found in sandbox."
-        return "Available files:\n" + "\n".join(f"  - {f}" for f in files)
-    except Exception as e:
-        return f"Error listing files: {str(e)}"
 
-tools = [read_file_content, write_file_content, list_sandbox_files]
+def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]:
+    """
+    Read file names/paths in a directory for the agent to process individually.
+    
+    Args:
+        directory_path: Path to the directory to read
+        
+    Returns:
+        Dictionary containing directory info and list of file paths
+    """
+    try:
+        dir_path = Path(directory_path)
+        
+        if not dir_path.exists():
+            return {"error": f"Directory not found: {directory_path}"}
+        
+        if not dir_path.is_dir():
+            return {"error": f"Path is not a directory: {directory_path}"}
+        
+        file_paths = [str(f) for f in sorted(dir_path.iterdir()) if f.is_file()]
+        
+        return {
+            "directory": str(dir_path),
+            "file_count": len(file_paths),
+            "files": file_paths
+        }
+    
+    except Exception as e:
+        return {"error": f"Error reading directory: {str(e)}"}
+
+tools = [read_file_content, write_file_content, read_directory]
 
 # 4. Define Prompt and Agent Executor
 prompt = ChatPromptTemplate.from_messages([
@@ -108,7 +153,7 @@ prompt = ChatPromptTemplate.from_messages([
     Your task is to:
     1. Review the refactoring plan provided by the auditor carefully
     2. For EACH file mentioned in the plan:
-       a. Use list_sandbox_files to see available files
+       a. Use read_directory to see available files
        b. Use read_file_content to read the current code
        c. Apply ALL the fixes mentioned in the refactoring plan
        d. Use write_file_content to save the corrected code

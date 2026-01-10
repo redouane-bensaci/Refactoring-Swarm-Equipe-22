@@ -26,19 +26,50 @@ if not OPENROUTER_API_KEY:
 SANDBOX_ROOT = Path(".").resolve()
 
 # 2. Initialize LLM (Streaming must be False for OpenRouter tool calls)
-llm = ChatOpenAI(
-    model= "meta-llama/llama-3.3-70b-instruct:free",
-    streaming=False,
+# Create a wrapper class to force non-streaming behavior
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_core.messages import AIMessageChunk, AIMessage
+from langchain_core.outputs import ChatGeneration
+
+class NonStreamingChatOpenAI(ChatOpenAI):
+    """Wrapper that forces non-streaming behavior for OpenRouter compatibility."""
+    
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        # Override stream to use non-streaming invoke instead
+        # This prevents the "Tools not supported in streaming mode" error
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        
+        # Call _generate with stream explicitly disabled
+        result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        message = result.generations[0].message
+        chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=message.content,
+                additional_kwargs=message.additional_kwargs,
+                id=message.id if hasattr(message, 'id') else None,
+            )
+        )
+        yield chunk
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # Ensure stream is always False
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+llm = NonStreamingChatOpenAI(
+    model="meta-llama/llama-3.3-70b-instruct:free",
     api_key=OPENROUTER_API_KEY,
     temperature=0,
     base_url="https://openrouter.ai/api/v1",
+    streaming=False,
+    model_kwargs={},
 )
-llm.streaming = False  # Ensure streaming is disabled
 
 # 3. Define Tools
 
 @tool
-# ...existing code...
 
 def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]:
     """
@@ -137,7 +168,7 @@ prompt = ChatPromptTemplate.from_messages([
     4. Include pylint messages in the plan to highlight issues.
     5. Include the pylint score at the end in the output.
     Always output the full refactoring plan when writing."""),
-    ("user", "Analyze the directory: {input}"),  # The input contains the directory path
+    ("user", "Analyze the target directory: {input}"),  # The input contains the directory path
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 

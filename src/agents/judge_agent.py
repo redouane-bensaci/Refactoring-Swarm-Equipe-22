@@ -1,5 +1,6 @@
 import os
 import subprocess
+from typing import Dict, List, Union
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
 from pathlib import Path
@@ -19,18 +20,46 @@ if not OPENROUTER_API_KEY:
 SANDBOX_ROOT = (Path(__file__).parent.parent.parent / "sandbox").resolve()
 
 # 2. Initialize LLM - CRITICAL: No streaming
-llm = ChatOpenAI(
+# Create a wrapper class to force non-streaming behavior
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_core.messages import AIMessageChunk, AIMessage
+from langchain_core.outputs import ChatGeneration
+
+class NonStreamingChatOpenAI(ChatOpenAI):
+    """Wrapper that forces non-streaming behavior for OpenRouter compatibility."""
+    
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        # Override stream to use non-streaming invoke instead
+        # This prevents the "Tools not supported in streaming mode" error
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        
+        # Call _generate with stream explicitly disabled
+        result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        message = result.generations[0].message
+        chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content=message.content,
+                additional_kwargs=message.additional_kwargs,
+                id=message.id if hasattr(message, 'id') else None,
+            )
+        )
+        yield chunk
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # Ensure stream is always False
+        kwargs.pop("stream", None)
+        kwargs["stream"] = False
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+llm = NonStreamingChatOpenAI(
     model="meta-llama/llama-3.3-70b-instruct:free",
     api_key=OPENROUTER_API_KEY,
     temperature=0,
     base_url="https://openrouter.ai/api/v1",
+    streaming=False,
+    model_kwargs={},
 )
-
-# FORCE disable streaming
-llm.streaming = False
-if hasattr(llm, 'model_kwargs'):
-    llm.model_kwargs = llm.model_kwargs or {}
-    llm.model_kwargs['stream'] = False
 
 # 3. Define Tools
 @tool
@@ -119,40 +148,45 @@ def run_pytest(test_path: str) -> str:
         return f"Error running pytest: {str(e)}"
 
 @tool
-def list_directory_files(directory_path: str) -> str:
-    """List all files in a directory.
+
+def read_directory(directory_path: str) -> Dict[str, Union[str, int, List[str]]]:
+    """
+    Read file names/paths in a directory for the agent to process individually.
     
     Args:
-        directory_path: Relative path from sandbox root
+        directory_path: Path to the directory to read
+        
+    Returns:
+        Dictionary containing directory info and list of file paths
     """
     try:
-        if directory_path.startswith('sandbox/'):
-            directory_path = directory_path.replace('sandbox/', '', 1)
-            
-        safe_path = (SANDBOX_ROOT / directory_path).resolve()
-
-        if not safe_path.is_relative_to(SANDBOX_ROOT):
-            return "Access denied: path outside sandbox"
+        dir_path = Path(directory_path)
         
-        if not safe_path.exists():
-            return f"Directory not found: {directory_path}"
+        if not dir_path.exists():
+            return {"error": f"Directory not found: {directory_path}"}
         
-        if not safe_path.is_dir():
-            return f"Not a directory: {directory_path}"
+        if not dir_path.is_dir():
+            return {"error": f"Path is not a directory: {directory_path}"}
         
-        files = [f.name for f in safe_path.iterdir() if f.is_file()]
-        return "Files in directory:\n" + "\n".join(f"  - {f}" for f in files)
+        file_paths = [str(f) for f in sorted(dir_path.iterdir()) if f.is_file()]
+        
+        return {
+            "directory": str(dir_path),
+            "file_count": len(file_paths),
+            "files": file_paths
+        }
+    
     except Exception as e:
-        return f"Error listing directory: {str(e)}"
+        return {"error": f"Error reading directory: {str(e)}"}
 
-tools = [read_file_content, write_file, run_pytest, list_directory_files]
+tools = [read_file_content, write_file, run_pytest, read_directory]
 
 # 4. Define Prompt and Agent Executor
 prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a Judge Agent specializing in Test-Driven Development (TDD) and code quality verification.
 
 Your task:
-1. **Read the corrected code files** from the target directory using read_file_content tool
+1. **Read the corrected code files** from the target directory using read_directory and read_file_content tools
 2. **Analyze each corrected file** and create comprehensive unit tests following TDD principles:
    - Test edge cases and boundary conditions
    - Test normal operation scenarios
