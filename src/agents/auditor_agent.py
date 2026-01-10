@@ -14,6 +14,10 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
+from src.prompts.auditor_prompts import get_auditor_system_prompt, get_auditor_user_prompt
+from src.utils.logger import log_experiment, ActionType
+
+
 # 1. Setup Environment
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -105,36 +109,77 @@ def run_pylint(file_path: str) -> str:
 tools = [read_file_content, write_file_content, run_pylint]
 
 # 4. Define Prompt and Agent Executor
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are an expert Senior Software Engineer. 
-    Your task is to:
-    1. Read all files in the directory "./sandbox" using the tool read_file_content.
-    2. For each file, run static analysis with pylint using the tool run_pylint.
-    3. Generate a refactoring plan in a .txt file named './sandbox/<original_filename>_refactor_plan.txt' using the tool write_file_content.
-    4. Include pylint messages in the plan to highlight issues.
-    5. Include the pylint score at the end in the output.
-    Always output the full refactoring plan when writing."""),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
 
-auditor_agent = create_openai_tools_agent(llm, tools, prompt)
-auditor_agent_executor = AgentExecutor(agent=auditor_agent, tools=tools, verbose=True)
+def create_auditor_agent(target_dir: str):
+    #create agent with a dynamic prompt
+    system_prompt = get_auditor_system_prompt(target_dir)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    
+    agent = create_openai_tools_agent(llm, tools, prompt)
+    return AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+
+def run_auditor_agent(target_dir: str) -> dict:
+    agent_executor = create_auditor_agent(target_dir)
+    user_input = get_auditor_user_prompt(target_dir)
+    
+    # Log before execution
+    log_experiment(
+        agent_name="Auditor_Agent",
+        model_used="meta-llama/llama-3.3-70b-instruct:free",
+        action=ActionType.ANALYSIS,
+        details={
+            "input_prompt": user_input,
+            "target_directory": target_dir,
+            "output_response": ""  # later
+        },
+        status="IN_PROGRESS"
+    )
+    
+    try:
+        result = agent_executor.invoke({"input": user_input})
+        
+        # Log success
+        log_experiment(
+            agent_name="Auditor_Agent",
+            model_used="meta-llama/llama-3.3-70b-instruct:free",
+            action=ActionType.ANALYSIS,
+            details={
+                "input_prompt": user_input,
+                "output_response": result["output"],
+                "target_directory": target_dir
+            },
+            status="SUCCESS"
+        )
+        
+        return {"output": result["output"], "status": "SUCCESS"}
+    
+    except Exception as e:
+        # Log failure
+        log_experiment(
+            agent_name="Auditor_Agent",
+            model_used="meta-llama/llama-3.3-70b-instruct:free",
+            action=ActionType.ANALYSIS,
+            details={
+                "input_prompt": user_input,
+                "output_response": str(e)
+            },
+            status="FAILURE"
+        )
+        
+        return {"output": str(e), "status": "FAILURE"}
 
 # 5. DEFINE LANGGRAPH 0.0.25 LOGIC
 class AgentState(TypedDict):
     input: str
     output: str
 
-def run_auditor_agent(state: AgentState):
+def run_auditor_agent_langgraph(state: AgentState):
 
-    response = auditor_agent_executor.invoke(
-        {
-            "input": state["input"],
-        },
-        # This config helps override legacy streaming behaviors
-        config={"callbacks": []} 
-    )
-
-    return {
-        "output": response["output"]
-    }
+    result = run_auditor_agent(state["input"])
+    
+    return {"output": result["output"]}
